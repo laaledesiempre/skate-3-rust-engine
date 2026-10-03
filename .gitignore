@@ -1,4 +1,6 @@
 /target/
+.venv/
+.deck-env
 /bin/
 /logs/
 /.local/

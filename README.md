@@ -57,8 +57,8 @@ Experimental Linux support. Install the system dependencies (wayland,
 libxcb, libxkbcommon, alsa-lib, libudev/eudev, clang) and run `BUILD.sh`,
 then `PLAY.sh`. On musl systems BUILD.sh links dynamically
 (`-C target-feature=-crt-static`); use `--no-default-features` to skip the
-glibc-only Steam helper and Bevy dynamic linking. See
-[docs/LINUX.md](docs/LINUX.md) for details.
+glibc-only Steam helper and Bevy dynamic linking. On Steam Deck (no sudo)
+use `./steamdeck_setup.sh`. See [docs/LINUX.md](docs/LINUX.md).
 
 Implementation notes are in [`docs/`](docs/). Patched Bevy dependencies and
 their licenses are in [`vendor/`](vendor/). This is an unofficial project,

@@ -14,15 +14,51 @@ use std::cell::{Cell, RefCell};
 // it with the standard SDL_GAMECONTROLLERCONFIG env var.
 const GAMECONTROLLERDB: &str = include_str!("../../gamecontrollerdb.txt");
 
-// Same layout as the upstream DB entry for the DragonRise 0079:0006 adapter,
-// but with the exact GUID this unit reports (version field 1001 instead of
-// 0107). Candidate for submission to SDL_GameControllerDB; remove once the
-// DB covers this GUID variant.
-const EXTRA_MAPPINGS: &str = "03000000790000000600000010010000,DragonRise Inc. Generic USB Joystick,platform:Linux,a:b2,b:b1,x:b3,y:b0,back:b8,start:b9,leftstick:b10,rightstick:b11,leftshoulder:b4,rightshoulder:b5,dpup:h0.1,dpdown:h0.4,dpleft:h0.8,dpright:h0.2,leftx:a0,lefty:a1,rightx:a2,righty:a3,lefttrigger:b6,righttrigger:b7,";
+// Extra GUID rows. DragonRise reports version 1001 (upstream has 0107).
+// Steam Deck (28de:1205) firmware versions the bundled DB may omit.
+const EXTRA_MAPPINGS: &str = "\
+03000000790000000600000010010000,DragonRise Inc. Generic USB Joystick,platform:Linux,a:b2,b:b1,x:b3,y:b0,back:b8,start:b9,leftstick:b10,rightstick:b11,leftshoulder:b4,rightshoulder:b5,dpup:h0.1,dpdown:h0.4,dpleft:h0.8,dpright:h0.2,leftx:a0,lefty:a1,rightx:a2,righty:a3,lefttrigger:b6,righttrigger:b7,\n\
+03000000de2800000512000000000000,Valve Steam Deck,a:b3,b:b4,back:b11,dpdown:b17,dpleft:b18,dpright:b19,dpup:b16,guide:b13,leftshoulder:b7,leftstick:b14,lefttrigger:a9,leftx:a0,lefty:a1,rightshoulder:b8,rightstick:b15,righttrigger:a8,rightx:a2,righty:a3,start:b12,x:b5,y:b6,platform:Linux,\n\
+03000000de2800000512000001000000,Valve Steam Deck,a:b3,b:b4,back:b11,dpdown:b17,dpleft:b18,dpright:b19,dpup:b16,guide:b13,leftshoulder:b7,leftstick:b14,lefttrigger:a9,leftx:a0,lefty:a1,rightshoulder:b8,rightstick:b15,righttrigger:a8,rightx:a2,righty:a3,start:b12,x:b5,y:b6,platform:Linux,\n\
+05000000de2800000512000001000000,Valve Steam Deck,a:b3,b:b4,back:b11,dpdown:b17,dpleft:b18,dpright:b19,dpup:b16,guide:b13,leftshoulder:b7,leftstick:b14,lefttrigger:a9,leftx:a0,lefty:a1,rightshoulder:b8,rightstick:b15,righttrigger:a8,rightx:a2,righty:a3,start:b12,x:b5,y:b6,platform:Linux,\n\
+";
 
 thread_local! {
     static GILRS: RefCell<Option<Gilrs>> = const { RefCell::new(None) };
     static PACKET: Cell<u32> = const { Cell::new(0) };
+    static LOGGED: RefCell<String> = const { RefCell::new(String::new()) };
+}
+
+/// Rank evdev nodes so a Steam Deck touchpad/keyboard does not steal slot 0.
+pub(crate) fn pad_score(name: &str, mapped: bool, has_left_stick: bool) -> i32 {
+    let n = name.to_ascii_lowercase();
+    if ["keyboard", "mouse", "touchpad", "trackpad", "touch screen"]
+        .iter()
+        .any(|needle| n.contains(needle))
+    {
+        return -10;
+    }
+    let mut score = 0;
+    if mapped {
+        score += 4;
+    }
+    if has_left_stick {
+        score += 2;
+    }
+    if [
+        "steam deck",
+        "neptune",
+        "x-box",
+        "xbox",
+        "xinput",
+        "steam virtual",
+    ]
+    .iter()
+    .any(|needle| n.contains(needle))
+    {
+        score += 3;
+    }
+    score
 }
 
 fn with_gilrs<R>(f: impl FnOnce(&mut Gilrs) -> R) -> Result<R, DeviceError> {
@@ -40,6 +76,49 @@ fn with_gilrs<R>(f: impl FnOnce(&mut Gilrs) -> R) -> Result<R, DeviceError> {
         }
         Ok(f(slot.as_mut().unwrap()))
     })
+}
+
+fn select_pads(gilrs: &Gilrs) -> Vec<gilrs::GamepadId> {
+    let mut pads: Vec<(i32, gilrs::GamepadId, String)> = gilrs
+        .gamepads()
+        .filter(|(_, gamepad)| gamepad.is_connected())
+        .map(|(id, gamepad)| {
+            let has_stick = gamepad.axis_data(Axis::LeftStickX).is_some()
+                && gamepad.axis_data(Axis::LeftStickY).is_some();
+            let score = pad_score(gamepad.name(), gamepad.is_mapped(), has_stick);
+            (
+                score,
+                id,
+                format!(
+                    "{} mapped={} stick={} score={score}",
+                    gamepad.name(),
+                    gamepad.is_mapped(),
+                    has_stick
+                ),
+            )
+        })
+        .collect();
+    if pads.iter().any(|(score, _, _)| *score > 0) {
+        pads.retain(|(score, _, _)| *score > 0);
+    }
+    pads.sort_by(|a, b| b.0.cmp(&a.0).then(usize::from(a.1).cmp(&usize::from(b.1))));
+    let summary = pads
+        .iter()
+        .map(|(_, _, line)| line.as_str())
+        .collect::<Vec<_>>()
+        .join(" | ");
+    LOGGED.with(|logged| {
+        let mut logged = logged.borrow_mut();
+        if *logged != summary {
+            if summary.is_empty() {
+                eprintln!("INPUT no gamepad (Steam Deck: hold ☰ Start 2s to leave desktop keyboard mode)");
+            } else {
+                eprintln!("INPUT {summary}");
+            }
+            *logged = summary;
+        }
+    });
+    pads.into_iter().map(|(_, id, _)| id).collect()
 }
 
 fn button_bits(gamepad: &gilrs::Gamepad) -> u16 {
@@ -87,12 +166,7 @@ fn trigger(gamepad: &gilrs::Gamepad, button: Button, axis: Axis) -> u8 {
 pub(super) fn poll(index: u32, cache: &mut CapabilityCache) -> Result<DevicePacket, DeviceError> {
     with_gilrs(|gilrs| {
         while let Some(_event) = gilrs.next_event() {}
-        let mut connected: Vec<_> = gilrs
-            .gamepads()
-            .filter(|(_, gamepad)| gamepad.is_connected())
-            .map(|(id, _)| id)
-            .collect();
-        connected.sort_by_key(|id| usize::from(*id));
+        let connected = select_pads(gilrs);
         let Some(&id) = connected.get(index as usize) else {
             cache.invalidate();
             return Err(DeviceError::Disconnected);
@@ -118,4 +192,22 @@ pub(super) fn poll(index: u32, cache: &mut CapabilityCache) -> Result<DevicePack
             subtype,
         })
     })?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pad_score;
+
+    #[test]
+    fn steam_deck_outranks_touchpad_and_keyboard() {
+        let deck = pad_score("Valve Steam Deck", true, true);
+        assert!(deck > pad_score("Steam Deck Touchpad", true, false));
+        assert!(deck > pad_score("Valve Software Steam Keyboard", false, false));
+        assert!(deck > pad_score("Generic USB Joystick", false, false));
+    }
+
+    #[test]
+    fn xbox_alias_is_preferred_over_unmapped() {
+        assert!(pad_score("Microsoft X-Box 360 pad", true, true) > pad_score("Unknown", false, false));
+    }
 }
